@@ -1,0 +1,379 @@
+---
+title: "Iowa Lakeside Lab Buoy Data Cleaning"
+output: html_notebook
+---
+Goal is to clean and publish buoy data for West Okoboji, 2015 - 2021
+
+Packages:
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(mosaic)
+library(here)
+library(rLakeAnalyzer)
+```
+
+# Read in all the data, merge into one dataset. 
+Read in Data
+```{r}
+buoy <- read_csv(here("Input Data/West Okoboji/West_Okoboji_Data_for_R_2015_2020.csv")) %>% mutate(CO2_ppm = as.double(CO2_ppm))
+buoy$`Date/Time_m/d/y` <- as.POSIXct(buoy$`Date/Time_m/d/y`, format = "%m/%d/%Y %H:%M")
+
+
+buoy_2021 <- read_csv(here("Input Data/West Okoboji/West_Okoboji_Data_for_R_2021.csv"))
+buoy_2021$`Date/Time_m/d/y` <- as.POSIXct(buoy_2021$`Date/Time_m/d/y`, format = "%m/%d/%Y %H:%M")
+
+#change 2021 units
+buoy_2021 <- buoy_2021 %>% mutate(`Rel. Barometric Pressure_inHg` = `Rel. Barometric Pressure_inHg`*33.86, WindSp_mph = WindSp_mph*0.44704, `Temperature at surface_F` = (`Temperature at surface_F`-32)*5/9) %>% rename("Rel. BP_mBar" = `Rel. Barometric Pressure_inHg`, "WindSp_m/s" = WindSp_mph, Temp_c = `Temperature at surface_F`)
+
+#change depth temps to celcius
+buoy_2021[,grepl("Temp .+", colnames(buoy_2021))] <- lapply(
+  buoy_2021[,grepl("Temp .+", colnames(buoy_2021))], 
+  function(x) (x-32)*5/9)
+
+#get rid of duplicate time stamps
+buoy_2021 <- buoy_2021[!duplicated(buoy_2021$`Date/Time_m/d/y`), ]
+
+buoy <- bind_rows(buoy, buoy_2021)
+
+```
+
+## Data Exploration
+### Look at the raw data
+```{r}
+head(buoy)
+summary(buoy)
+```
+
+
+# Cleaning
+Structure the dataset to long (move depth to a variable)
+```{r}
+#Pull just sonde and thermistor chain data
+water <- buoy %>% select(`Date/Time_m/d/y`, c(14:59)) %>% rename("Temp 1m" = "Temp_c", "DO 1m" = "ODO_mg/l", "DOSat 1m" = "ODOSat_%")
+
+#Split surface water data and temp and do profile data
+do_temp <- water %>% select(-c(3,4,7:11))
+chem <- water %>% select(c(1,3,4,7:11))
+
+# make temp data long
+do_temp_long <- do_temp %>% pivot_longer( cols = !`Date/Time_m/d/y`,
+    names_to = c("Var", "Depth_m"),
+     names_sep = " ") %>% pivot_wider(names_from = "Var", values_from = "value") %>%
+  mutate(Depth_m = as.double(gsub("m","", Depth_m)))
+```
+
+Clean each column
+```{r, fig.width = 10, fig.asp = .33}
+#Change all NAs to NA
+do_temp_long <- do_temp_long %>% mutate(DO = ifelse(DO <=-999, NA, DO),
+                                        DOSat = ifelse(DOSat <=-999, NA, DOSat),
+                                        Temp = ifelse(Temp <=-999, NA, Temp))
+
+#Set min to zero
+do_temp_long <- do_temp_long %>% mutate(DO = ifelse(DO <= 0, 0, DO),
+                                        DOSat = ifelse(DOSat <= 0, 0, DOSat),
+                                        Temp = ifelse(Temp <= 0, 0, Temp))
+
+summary(do_temp_long)
+
+
+#rename columns
+do_temp_final <- do_temp_long %>% rename(datetime = `Date/Time_m/d/y`, depth = Depth_m, do_sat = DOSat, do = DO, temp = Temp)
+
+do_temp_final$year <- format(do_temp_final$datetime, "%Y")
+
+#Add flags for each column
+do_temp_final$do_flags <- as.double(NA)
+do_temp_final$do_sat_flags <- as.double(NA)
+do_temp_final$temp_flags <- as.double(NA)
+
+
+# Manually flag problem data points
+## start with impossible values
+do_temp_final <- do_temp_final %>% mutate(do_flags = case_when(
+  depth == 1 & do <= 2 ~ 1,
+  depth == 1 & do >= 20 ~ 1,
+  TRUE ~ do_flags)) %>% mutate(temp_flags = case_when(
+    temp <= 4 ~ 1,
+    TRUE ~ temp_flags))
+
+## Start times each year
+do_temp_final <- do_temp_final %>% mutate(do_flags = case_when(
+  year == 2016 & depth >= 1 & datetime <= as.POSIXct("2016-04-23 10:30:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(temp_flags = case_when(
+    year == 2016 & depth >= 1 & datetime <= as.POSIXct("2016-04-23 10:30:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(do_flags = case_when(
+   year == 2017 & depth >= 1 & datetime <= as.POSIXct("2017-04-28 11:50:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(temp_flags = case_when(
+    year == 2017 & depth >= 1 & datetime <= as.POSIXct("2017-04-28 11:50:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(do_flags = case_when(
+   year == 2018 & datetime <= as.POSIXct("2018-08-14 08:50:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(temp_flags = case_when(
+    year == 2018 & datetime <= as.POSIXct("2018-08-14 08:50:00") ~ 1,
+  TRUE ~ temp_flags)) %>%   
+  mutate(do_flags = case_when(
+   year == 2021 & datetime <= as.POSIXct("2021-05-11 10:40:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(temp_flags = case_when(
+    year == 2021 & datetime <= as.POSIXct("2021-05-11 10:40:00") ~ 1,
+  TRUE ~ temp_flags))
+
+# Other specific points to flag
+do_temp_final <- do_temp_final %>% mutate(do_flags = case_when(
+  year == 2021 & depth == 1 & datetime >= as.POSIXct("2021-09-28 00:00:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2015 & depth == 1 & datetime >= as.POSIXct("2015-07-07 07:00:00") &
+    datetime <= as.POSIXct("2015-07-07 13:40:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2015 & depth == 1 & datetime == as.POSIXct("2015-11-02 09:30:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2016 & depth >= 1 & datetime >= as.POSIXct("2016-08-19 09:10:00") &
+    datetime <= as.POSIXct("2016-08-19 16:20:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2019 & depth >= 1 & datetime >= as.POSIXct("2019-08-01 10:50:00") &
+    datetime <= as.POSIXct("2019-08-01 11:20:00") ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2017 & do >= 30 ~ 1,
+  TRUE ~ do_flags)) %>% mutate(do_flags = case_when(
+  year == 2015 & depth >= 1 & datetime >= as.POSIXct("2015-07-28 12:10:00") &
+    datetime <= as.POSIXct("2015-07-28 12:20:00	") ~ 1,
+  TRUE ~ do_flags)) %>%
+  mutate(temp_flags = case_when(
+    year == 2015 & depth == 1 & datetime >= as.POSIXct("2015-07-07 07:00:00") &
+    datetime <= as.POSIXct("2015-07-07 13:40:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(temp_flags = case_when(
+    year == 2015 & depth == 1 & datetime == as.POSIXct("2015-11-02 09:30:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(temp_flags = case_when(
+    year == 2016 & depth == 1 & datetime >= as.POSIXct("2016-08-15 09:30:00") &
+    datetime <= as.POSIXct("2016-08-15 09:50:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(temp_flags = case_when(
+    year == 2016 & depth >= 1 & datetime >= as.POSIXct("2016-08-19 09:10:00") &
+    datetime <= as.POSIXct("2016-08-19 16:20:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(temp_flags = case_when(
+    year == 2017 & depth == 1 & datetime == as.POSIXct("2017-10-24 05:30:00") ~ 1,
+  TRUE ~ temp_flags)) %>% 
+  mutate(temp_flags = case_when(
+    year == 2019 & depth >= 1 & datetime >= as.POSIXct("2019-08-01 10:50:00") &
+    datetime <= as.POSIXct("2019-08-01 11:20:00") ~ 1,
+  TRUE ~ temp_flags)) %>% mutate(temp_flags = case_when(
+  year == 2015 & depth >= 1 & datetime >= as.POSIXct("2015-07-28 12:10:00") &
+    datetime <= as.POSIXct("2015-07-28 12:20:00	") ~ 1,
+  TRUE ~ temp_flags)) %>% mutate(do_flags = case_when(
+  year == 2018 & depth >= 15 ~ 1,
+  TRUE ~ do_flags))
+
+#add flags to DO saturation
+do_temp_final <- do_temp_final %>% mutate(do_sat_flags = case_when(
+  do_flags == 1 ~ 1,
+  temp_flags == 1 ~ 1,
+  TRUE ~ do_sat_flags))
+
+do_temp_final <- do_temp_final[!is.na(do_temp_final$temp) |
+                                 !is.na(do_temp_final$do_sat) |
+                                 !is.na(do_temp_final$do),]
+
+```
+
+Clean surface water chemistry data
+```{r, fig.width = 10, fig.asp = .33}
+#rename columns/add depth of 1m
+chem_final <- chem %>% rename(sp_cond = `Sp Cond_us/cm` , ph = pH, bga_pc = `BGA-PC_ug/l`, bga_pc_rfu = `BGA-PC_rfu`, chl_rfu = `Chl RFU_rfu`, chl = `Chlorophyll RAW`, co2 = CO2_ppm, datetime = `Date/Time_m/d/y`) %>%
+  mutate(year = format(datetime, "%Y"))
+
+summary(chem_final)
+
+#Change all NAs to NA
+chem_final <- chem_final %>% mutate(sp_cond = ifelse(sp_cond <=0, NA, sp_cond),
+                                        ph = ifelse(ph <=0, NA, ph),
+                                        co2 = ifelse(co2 <=0, NA, co2),
+                                        bga_pc = ifelse(bga_pc <=-0.1, NA, bga_pc),
+                                        bga_pc_rfu = ifelse(bga_pc_rfu <=-0.1, NA, bga_pc_rfu))
+
+
+#Add flags
+chem_final <- chem_final %>% mutate(sp_cond_flags = as.double(NA),
+                                    ph_flags = as.double(NA),
+                                    bga_pc_flags = as.double(NA),
+                                    bga_pc_rfu_flags = as.double(NA),
+                                    chl_flags = as.double(NA),
+                                    chl_rfu_flags = as.double(NA),
+                                    co2_flags = as.double(NA))
+
+# Manually flag problem data points for conductivity and ph
+## start with impossible values
+chem_final <- chem_final %>% mutate(sp_cond_flags = case_when(
+  sp_cond <= 300 & sp_cond >= 0 ~ 1,
+  sp_cond >= 600 ~ 1,
+  TRUE ~ sp_cond_flags)) %>% 
+  mutate(ph_flags = case_when(
+    ph <= 8 ~ 1,
+    ph >= 9 ~ 1,
+    TRUE ~ ph_flags))
+
+# Other specific points to flag
+chem_final <- chem_final %>% mutate(sp_cond_flags = case_when(
+  year == 2015 & datetime >= as.POSIXct("2015-07-07 06:20:00") &
+    datetime <= as.POSIXct("2015-07-07 13:40:00	") ~ 1,
+  TRUE ~ sp_cond_flags)) %>% mutate(sp_cond_flags = case_when(
+  year == 2016 & datetime >= as.POSIXct("2016-07-24 20:20:00") &
+    datetime <= as.POSIXct("2016-07-24 23:40:00") ~ 1,
+  TRUE ~ sp_cond_flags)) %>% mutate(sp_cond_flags = case_when(
+  year == 2016 & datetime >= as.POSIXct("2016-08-07 16:20:00") &
+    datetime <= as.POSIXct("2016-08-09 16:20:00") ~ 1,
+  TRUE ~ sp_cond_flags)) %>%
+  mutate(ph_flags = case_when(
+  year == 2018 & datetime >= as.POSIXct("2018-08-09 06:00:00	") &
+    datetime <= as.POSIXct("2018-08-14 08:50:00") ~ 1,
+  TRUE ~ ph_flags)) %>%
+  mutate(ph_flags = case_when(
+  year == 2019 & datetime >= as.POSIXct("2019-06-26 11:10:00") ~ 1,
+  TRUE ~ ph_flags)) %>%
+  mutate(ph_flags = case_when(
+  year == 2021 & datetime >= as.POSIXct("2021-06-25 16:00:00") ~ 1,
+  TRUE ~ ph_flags)) %>%
+  mutate(ph_flags = case_when(
+  year == 2021 & datetime <= as.POSIXct("2021-05-11 11:10:00") ~ 1,
+  TRUE ~ ph_flags)) %>% mutate(bga_pc_flags = 1) %>% mutate(bga_pc_rfu_flags = 1) %>% 
+  mutate(chl_rfu_flags = 1) %>% mutate(chl_flags = 1) %>% mutate(co2_flags = 1) %>%
+  mutate(sp_cond_flags = case_when(year == 2021 & sp_cond <= 410 ~ 1,
+  TRUE ~ sp_cond_flags)) %>% mutate(sp_cond_flags = case_when(
+    year == 2020 & sp_cond <= 400 |
+      year == 2019 & sp_cond <= 400 |
+      year == 2017 & sp_cond <= 440 ~ 1,
+  TRUE ~ sp_cond_flags))
+
+chem_final <- chem_final[!is.na(chem_final$sp_cond) |
+                           !is.na(chem_final$ph) |
+                           !is.na(chem_final$bga_pc)|
+                           !is.na(chem_final$bga_pc_rfu) |
+                           !is.na(chem_final$chl_rfu) |
+                           !is.na(chem_final$chl) |
+                           !is.na(chem_final$co2),]
+
+```
+
+# Clean Weather station data
+```{r, fig.width = 10, fig.asp = .33}
+weather <- buoy %>% select(`Date/Time_m/d/y`, AirTemp_c, `RH_%`, `Rel. BP_mBar`, `WindSp_m/s`,
+                           `Max WindSp_m/s`, WindDir_degree, `Wet Bulb Temp_c`, `Precip Type`,
+                           `RainInten_mm/h`, DailyRain_mm, IntvRain_mm, Head_degree)
+
+
+#rename columns
+weather_final <- weather %>% rename(datetime = `Date/Time_m/d/y`, air_temp = AirTemp_c,
+                                    humidity = `RH_%`, barometric_pressure = `Rel. BP_mBar`,
+                                    wind_speed = `WindSp_m/s`, 
+                                    max_wind_speed = `Max WindSp_m/s`, 
+                                    wet_bulb_temp = `Wet Bulb Temp_c`,
+                                    precip_type = `Precip Type`, 
+                                    rain_inten = `RainInten_mm/h`,
+                                    rain_daily = DailyRain_mm, rain_intv = IntvRain_mm,
+                                    heading = Head_degree,
+                                    wind_dir = WindDir_degree) %>% 
+  mutate(year = format(datetime, "%Y"))
+
+summary(weather_final)
+
+#Change all NAs to NA
+create_nas <- function(x){
+  x = ifelse(x <= -999, NA, x)
+  }
+weather_final <- lapply(weather_final[,2:14], create_nas) %>% data.frame() %>% mutate(datetime = weather$`Date/Time_m/d/y`)
+
+#Flag impossible values
+#Add flags
+weather_final <- weather_final %>% mutate(air_temp_flags = as.double(NA),
+                                    humidity_flags = as.double(NA),
+                                    barometric_pressure_flags = as.double(NA),
+                                    wind_speed_flags = as.double(NA),
+                                    max_wind_speed_flags = as.double(NA),
+                                    wind_dir_flags = as.double(NA),
+                                    rain_inten_flags = as.double(NA),
+                                    rain_daily_temp_flags = as.double(NA),
+                                    rain_intv_temp_flags = as.double(NA))
+
+
+weather_final <- weather_final %>% mutate(barometric_pressure_flags = case_when(
+  barometric_pressure <= 800 ~ 1,
+  barometric_pressure >= 2000 ~ 1,
+  TRUE ~ barometric_pressure_flags)) %>%
+  mutate(wind_speed_flags = case_when(
+  wind_speed >= 50 ~ 1,
+  TRUE ~ wind_speed_flags))  %>%
+  mutate(humidity_flags = case_when(
+  humidity >= 101 ~ 1,
+  TRUE ~ humidity_flags))
+
+# 2018 start date
+weather_final[weather_final$year == 2018 & 
+                weather_final$datetime <= as.POSIXct("2018-08-13 14:00:00"), 
+              c("air_temp_flags", "humidity_flags", "barometric_pressure_flags", 
+                "wind_speed_flags", "max_wind_speed_flags", "wind_dir_flags", 
+                "rain_inten_flags", "rain_daily_temp_flags", "rain_intv_temp_flags")] <- 1
+
+
+weather_final <- weather_final %>% mutate(max_wind_speed_flags = case_when(
+  wind_speed_flags == 1 ~ 1,
+  TRUE ~ max_wind_speed_flags))
+
+#Take out timepoints with all NAs
+weather_final <- weather_final[!is.na(weather_final$air_temp) |
+                           !is.na(weather_final$humidity) |
+                           !is.na(weather_final$barometric_pressure)|
+                           !is.na(weather_final$wind_speed) |
+                           !is.na(weather_final$wet_bulb_temp) |
+                           !is.na(weather_final$rain_daily),]
+
+```
+
+# Final Datasets
+```{r}
+
+buoy_final <- merge(weather_final, chem_final, by = c("datetime", "year"), all.x = TRUE)
+
+#Reorder, put in month
+do_temp_flags <- do_temp_final  %>% select(order(colnames(do_temp_final))) %>% 
+  mutate(month = format(datetime, "%b")) %>%
+  select(datetime, year, month, everything())
+
+buoy_final_flags <- buoy_final %>% select(order(colnames(buoy_final))) %>%
+  mutate(month = format(datetime, "%b")) %>%
+  select(datetime, year, month, everything())
+  
+
+#function to remove flags
+remove_flagged_values <- function(df){
+  for(i in 1:length(df)){
+    col <- colnames(df)[i]
+    col_flags <- paste(colnames(df)[i], "_flags", sep="")
+    if(col_flags %in% colnames(df)){
+      df[[col]][df[[col_flags]] == 1] <- NA
+    }
+  }
+  df
+}
+
+do_temp_no_flags <- remove_flagged_values(do_temp_flags) %>% select(!contains("flags"))
+
+buoy_final_no_flags <- remove_flagged_values(buoy_final_flags) %>% select(!contains("flags")) %>% select(!c(co2, chl, chl_rfu, bga_pc_rfu, bga_pc))
+```
+
+#write final datasets
+```{r}
+write.csv(do_temp_no_flags, here("Output Data/West Okoboji/West_Okoboji_Temp_and_Oxygen.csv"), row.names = FALSE)
+
+write.csv(do_temp_flags, here("Output Data/West Okoboji/West_Okoboji_Temp_and_Oxygen_full_dataset_flagged.csv"), row.names = FALSE)
+
+write.csv(buoy_final_no_flags, here("Output Data/West Okoboji/West_Okoboji_Weather_and_Chemistry_Data.csv"), row.names = FALSE)
+
+write.csv(buoy_final_flags, here("Output Data/West Okoboji/West_Okoboji_Weather_and_Chemistry_Data_full_dataset_flagged.csv"), row.names = FALSE)
+```
+
+

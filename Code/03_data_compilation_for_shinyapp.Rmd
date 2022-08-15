@@ -1,0 +1,143 @@
+---
+title: "Data Compilation for Shiny App"
+author: "Joseph Rabaey"
+date: '2022-08-08'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(mosaic)
+library(here)
+library(rLakeAnalyzer)
+```
+
+## Read in finalized datasets
+```{r}
+# Okoboji water temp and oxygen data
+ok_wtr <- read.csv(here("Output Data/West Okoboji/West_Okoboji_Temp_and_Oxygen.csv"))
+
+# Okoboji weather data
+ok_wth <- read.csv(here("Output Data/West Okoboji/West_Okoboji_Weather_and_Chemistry_Data.csv")) %>% mutate(depth = 1)
+
+# Big Spirit water temp and oxygen data
+bs_wtr <- read.csv(here("Output Data/Big Spirit/Big_Spirit_Temp_and_Oxygen.csv"))
+
+# Big Spirit weather data
+bs_wth <- read.csv(here("Output Data/Big Spirit/Big_Spirit_Weather_and_Chemistry_Data.csv")) %>% mutate(depth = 1)
+```
+
+# Merge two dataset for each lake into one
+```{r}
+ok <- merge(ok_wtr, ok_wth, all = TRUE) %>% mutate(datetime = as.POSIXct(datetime))
+
+bs <- merge(bs_wtr, bs_wth, all = TRUE) %>% mutate(datetime = as.POSIXct(datetime))
+```
+
+# Thermocline and schmidt stability data
+```{r}
+## Bathymetry for schmidt stability
+bth_ok <- approx.bathy(Zmax = 42.3, lkeArea = 1.5568e+7) %>% rename(areas = "Area.at.z")
+bth_bs <- approx.bathy(Zmax = 6.858, lkeArea = 2.3002e+7) %>% rename(areas = "Area.at.z")
+
+# Add thermocline and schimdt stability to the data
+#okoboji
+ok_wtr_list <- list()
+for(i in 1:length(unique(ok$year))){
+  wtr <- select(ok, datetime, depth, year, temp) %>% 
+    filter(year == unique(ok$year)[i]) %>% arrange(depth)
+  if(wtr$year[1] == 2019){
+    wtr <- wtr %>% filter(depth !=11)
+  }
+  if(wtr$year[1] == 2021){
+    wtr <- wtr %>% filter(depth !=7)
+  }
+  wtr <- wtr %>% 
+    pivot_wider(names_from = depth, 
+      names_prefix = "wtr_",
+      values_from = temp) %>% 
+    select(!year) %>% na.omit() %>% as.data.frame()
+  wtr <- merge(wtr, ts.thermo.depth(wtr))
+  wtr <- merge(wtr, ts.schmidt.stability(select(wtr, !thermo.depth), bth_ok)) %>%
+    select(datetime, thermo.depth, schmidt.stability)
+  ok_wtr_list[[i]] <- wtr
+} 
+ok <- merge(ok, bind_rows(ok_wtr_list), all.x = TRUE)
+ok <- ok[with(ok, order(datetime, depth)), ]
+
+#Big Spirit
+bs_wtr_list <- list()
+for(i in 1:length(unique(bs$year))){
+  wtr <- select(bs, datetime, depth, year, temp) %>% 
+    filter(year == unique(bs$year)[i]) %>% arrange(depth)
+  if(wtr$year[1] == 2021){
+    wtr <- wtr %>% filter(depth !=1)
+  }
+  wtr <- wtr %>% 
+    pivot_wider(names_from = depth, 
+                names_prefix = "wtr_",
+                values_from = temp) %>% 
+    select(!year) %>% na.omit() %>% as.data.frame()
+  wtr <- merge(wtr, ts.thermo.depth(wtr))
+  wtr <- merge(wtr, ts.schmidt.stability(select(wtr, !thermo.depth), bth_ok)) %>%
+    select(datetime, thermo.depth, schmidt.stability)
+  bs_wtr_list[[i]] <- wtr
+} 
+bs <- merge(bs, bind_rows(ok_wtr_list), all.x = TRUE)
+```
+
+
+# Yearly Summary
+```{r}
+# Yearly Dataset for okoboji
+depletion_rates <- ok %>% filter(depth == 25, year != 2015) %>% 
+  filter(year != 2018) %>%  group_by(year) %>% filter(do <= 0.1) %>%
+  summarize(
+    stop_date = min(datetime),
+    depletion_rate = NA
+  )
+for(i in 1:5){
+  dep <- filter(ok, year == depletion_rates$year[i], depth == 25)
+  dep$time_days <- as.double(
+    lubridate::as.duration(dep$datetime - dep$datetime[1]))/1440/60
+  
+  dep_sub <- subset(dep, datetime <= depletion_rates$stop_date[i])
+  lm <- lm(data = dep_sub, do ~ time_days)
+  
+  depletion_rates$depletion_rate[i] <- coef(lm)[2]
+}
+
+anoxia_duration <- ok %>% group_by(year) %>% filter(year != 2015) %>%
+  filter(depth == 25 & do <= 0.1) %>% summarize(
+  anoxia_start = min(datetime),
+  anoxia_end = max(datetime),
+  anoxia_duration = as.double(anoxia_end - anoxia_start)
+)
+
+strat_duration <- ok %>% group_by(year) %>% filter(year != 2015) %>%
+  filter(schmidt.stability >= 200) %>%
+  summarize(
+    strat_start = min(datetime),
+    strat_end = max(datetime),
+    strat_duration = as.double(strat_end - strat_start)
+  )
+
+summer <- merge(ok %>% group_by(year) %>% 
+  filter(month == "Jun" | month == "Jul" | month == "Aug") %>% 
+  summarize(mean_summer_thermo = mean(na.omit(thermo.depth))),
+  ok %>% group_by(year) %>% 
+  filter(month == "Apr" | month == "May") %>% 
+  summarize(mean_spring_temp = mean(na.omit(air_temp)))) %>%
+  merge(strat_duration) %>% merge(anoxia_duration) %>% merge(depletion_rates)
+```
+
+# Write files for shiny app
+```{r}
+write.csv(ok, here("Output Data/Shiny App/Okoboji_Data.csv"), row.names = FALSE)
+write.csv(bs, here("Output Data/Shiny App/Big_Spirit_Data.csv"), row.names = FALSE)
+write.csv(summer, here("Output Data/Shiny App/yearly_summary.csv"), row.names = FALSE)
+
+```
+
